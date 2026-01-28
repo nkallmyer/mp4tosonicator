@@ -1,25 +1,34 @@
 # sequencer.py
+import audioop
+import contextlib
+import os
+import shutil
+import subprocess
+import tempfile
 import time
-from typing import List
+import wave
+from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from controllers import Calib, SlotPlan, GrblController, SonicatorController
+from controllers import SonicatorController
 
 
-class RunWorker(QThread):
+class AudioRunWorker(QThread):
     sig_log = pyqtSignal(str)
     sig_done = pyqtSignal(bool, str)
 
-    def __init__(self, grbl: GrblController, q125: SonicatorController,
-                 calib: Calib, plans: List[SlotPlan], rinse_slot_idx: int,
+    def __init__(self, q125: SonicatorController, audio_path: str,
+                 min_power_w: float, max_power_w: float,
+                 frame_ms: int, soundfont_path: Optional[str] = None,
                  parent=None):
         super().__init__(parent)
-        self.grbl = grbl
         self.q125 = q125
-        self.calib = calib
-        self.plans = plans
-        self.rinse_slot_idx = rinse_slot_idx
+        self.audio_path = audio_path
+        self.min_power_w = min_power_w
+        self.max_power_w = max_power_w
+        self.frame_ms = frame_ms
+        self.soundfont_path = soundfont_path
 
         self._stop = False
         self._pause = False
@@ -43,139 +52,114 @@ class RunWorker(QThread):
             if self._stop:
                 return
             self._wait_pause()
-            time.sleep(0.05)
+            time.sleep(0.01)
 
-    # ----- Kinematics -----
+    def _convert_midi_to_wav(self, path: str) -> Optional[str]:
+        if not self.soundfont_path:
+            self.log("Select a soundfont (.sf2) to render MIDI.")
+            return None
+        if not os.path.exists(self.soundfont_path):
+            self.log("Soundfont file does not exist.")
+            return None
+        if not shutil.which("fluidsynth"):
+            self.log("fluidsynth not found. Install fluidsynth to render MIDI.")
+            return None
 
-    def _x_for_slot(self, idx: int) -> float:
-        return self.calib.x_zero_offset_mm + self.calib.x_dir * (idx * self.calib.x_mm_per_slot)
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        cmd = [
+            "fluidsynth",
+            "-ni",
+            self.soundfont_path,
+            path,
+            "-F",
+            wav_path,
+            "-r",
+            "44100",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            self.log(f"fluidsynth failed: {result.stderr.strip()}")
+            os.remove(wav_path)
+            return None
+        return wav_path
 
-    def _y_up(self, clearance_mm: float = 0.0) -> float:
-        return self.calib.y_up_position(clearance_mm)
+    def _convert_to_wav(self, path: str) -> Optional[str]:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".wav":
+            return path
+        if ext in {".mid", ".midi"}:
+            return self._convert_midi_to_wav(path)
 
-    def _y_down(self) -> float:
-        return self.calib.y_down_position()
-
-    # ----- Moves -----
-
-    def _move_to_slot(self, idx: int) -> bool:
-        ok = self.grbl.move_abs(x=self._x_for_slot(idx), feed=self.calib.feed_xy)
-        self._sleep(self.calib.settle_after_move_s)
-        return ok
-
-    def _probe_up(self, clearance_mm: float = 0.0) -> bool:
-        ok = self.grbl.move_abs(y=self._y_up(clearance_mm), feed=self.calib.feed_y)
-        self._sleep(self.calib.settle_after_move_s)
-        return ok
-
-    def _probe_down(self) -> bool:
-        ok = self.grbl.move_abs(y=self._y_down(), feed=self.calib.feed_y)
-        self._sleep(self.calib.settle_after_move_s)
-        return ok
-
-    # ----- Sonication -----
-
-    def _sonicate_power_for(self, watts: float, seconds: int) -> bool:
-        self.q125.set_power(watts)
-        self.q125.run(True)
-        self.log(f"Sonicate: target {watts:.2f} W for {seconds}s")
-        self._sleep(seconds)
-        self.q125.run(False)
-        return not self._stop
-
-    def _safe_stop(self):
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "44100", wav_path]
         try:
-            self.q125.run(False)
-        except Exception:
-            pass
-        try:
-            self._probe_up(self.calib.y_home_clearance_mm)
-        except Exception:
-            pass
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            self.log("ffmpeg not found. Install ffmpeg to convert mp3/mp4 files.")
+            os.remove(wav_path)
+            return None
 
-    # ----- Main -----
+        if result.returncode != 0:
+            self.log(f"ffmpeg failed: {result.stderr.strip()}")
+            os.remove(wav_path)
+            return None
+
+        return wav_path
+
+    def _power_from_rms(self, rms: float, max_rms: float) -> float:
+        if max_rms <= 0:
+            return self.min_power_w
+        norm = min(max(rms / max_rms, 0.0), 1.0)
+        return self.min_power_w + norm * (self.max_power_w - self.min_power_w)
 
     def run(self):
+        wav_path = None
         try:
-            # Validate plan
-            sample_indices = [i for i, sp in enumerate(self.plans) if sp.kind == "SAMPLE"]
-            rinse_marked = [i for i, sp in enumerate(self.plans) if sp.kind == "RINSE"]
-
-            if len(sample_indices) < 1:
-                self.sig_done.emit(False, "No SAMPLE slots configured")
-                return
-            if len(rinse_marked) != 1:
-                self.sig_done.emit(False, "Mark exactly ONE slot as RINSE")
-                return
-            if rinse_marked[0] != self.rinse_slot_idx:
-                self.sig_done.emit(False, "Rinse slot index must match the slot marked RINSE")
+            wav_path = self._convert_to_wav(self.audio_path)
+            if not wav_path:
+                self.sig_done.emit(False, "Audio conversion failed")
                 return
 
-            self.log("=== START RUN ===")
+            with contextlib.closing(wave.open(wav_path, "rb")) as wf:
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                frame_rate = wf.getframerate()
+                if channels != 1:
+                    self.log(f"Expected mono audio; got {channels} channels. Using first channel.")
+                frame_size = max(1, int(frame_rate * (self.frame_ms / 1000.0)))
+                max_rms = float(2 ** (8 * sample_width - 1))
 
-            # Initialize GRBL
-            self.grbl.wake()
-            self.grbl.unlock()
-            if not self.grbl.home():
-                self.sig_done.emit(False, "GRBL homing failed")
-                return
-            self.grbl.set_work_origin()
+                self.log("=== START AUDIO SONICATION ===")
+                self.q125.run(True)
 
-            # Ensure safe starting state
-            self.q125.run(False)
-            self._probe_up(self.calib.y_home_clearance_mm)
+                while not self._stop:
+                    self._wait_pause()
+                    data = wf.readframes(frame_size)
+                    if not data:
+                        break
+                    rms = audioop.rms(data, sample_width)
+                    power = self._power_from_rms(rms, max_rms)
+                    self.q125.set_power(power)
+                    self._sleep(self.frame_ms / 1000.0)
 
-            # Loop samples
-            for idx in sample_indices:
-                if self._stop:
-                    break
-                self._wait_pause()
+                self.q125.run(False)
 
-                sp = self.plans[idx]
-                self.log(f"--- SAMPLE slot {idx}: {sp.power_w:.2f} W for {sp.time_s}s ---")
-
-                if not self._move_to_slot(idx):
-                    self._safe_stop()
-                    self.sig_done.emit(False, f"Move to sample slot {idx} failed")
-                    return
-                if not self._probe_down():
-                    self._safe_stop()
-                    self.sig_done.emit(False, f"Probe down failed at slot {idx}")
-                    return
-                if not self._sonicate_power_for(sp.power_w, sp.time_s):
-                    break
-                if not self._probe_up():
-                    self._safe_stop()
-                    self.sig_done.emit(False, f"Probe up failed after sample slot {idx}")
-                    return
-
-                # Rinse between samples
-                if self._stop:
-                    break
-
-                self.log(f"--- RINSE slot {self.rinse_slot_idx}: {self.calib.rinse_power_w:.2f} W for {self.calib.rinse_time_s}s ---")
-                if not self._move_to_slot(self.rinse_slot_idx):
-                    self._safe_stop()
-                    self.sig_done.emit(False, "Move to rinse slot failed")
-                    return
-                if not self._probe_down():
-                    self._safe_stop()
-                    self.sig_done.emit(False, "Probe down failed at rinse slot")
-                    return
-                if not self._sonicate_power_for(self.calib.rinse_power_w, self.calib.rinse_time_s):
-                    break
-                if not self._probe_up():
-                    self._safe_stop()
-                    self.sig_done.emit(False, "Probe up failed after rinse")
-                    return
-
-            # End
-            self._safe_stop()
             if self._stop:
                 self.sig_done.emit(False, "Stopped by user")
             else:
-                self.sig_done.emit(True, "Run complete")
+                self.sig_done.emit(True, "Audio playback complete")
 
-        except Exception as e:
-            self._safe_stop()
-            self.sig_done.emit(False, f"Exception: {e}")
+        except Exception as exc:
+            try:
+                self.q125.run(False)
+            except Exception:
+                pass
+            self.sig_done.emit(False, f"Exception: {exc}")
+        finally:
+            if wav_path and wav_path != self.audio_path:
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass

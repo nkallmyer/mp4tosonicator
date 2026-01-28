@@ -1,34 +1,28 @@
 # app.py
-from typing import Optional, List
+import os
+from typing import Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QComboBox, QTableWidget, QTableWidgetItem, QDoubleSpinBox, QSpinBox,
-    QGroupBox, QFormLayout, QMessageBox, QTextEdit
+    QLabel, QDoubleSpinBox, QSpinBox, QGroupBox, QFormLayout,
+    QMessageBox, QTextEdit, QFileDialog
 )
 
-from controllers import (
-    Calib, SlotPlan,
-    SerialDevice, GrblController, SonicatorController,
-    discover_devices
-)
-from sequencer import RunWorker
+from controllers import SerialDevice, SonicatorController, discover_devices
+from sequencer import AudioRunWorker
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Q125 Carousel Sonication Controller")
+        self.setWindowTitle("Q125 Audio Sonication Controller")
 
-        self.calib = Calib()
-        self.plans = [SlotPlan() for _ in range(self.calib.slots)]
-
-        self.dev_grbl: Optional[SerialDevice] = None
         self.dev_q125: Optional[SerialDevice] = None
-        self.grbl: Optional[GrblController] = None
         self.q125: Optional[SonicatorController] = None
-        self.worker: Optional[RunWorker] = None
+        self.worker: Optional[AudioRunWorker] = None
+        self.audio_path: Optional[str] = None
+        self.soundfont_path: Optional[str] = None
 
         self._build_ui()
 
@@ -41,17 +35,17 @@ class MainWindow(QMainWindow):
 
         # Buttons
         top = QHBoxLayout()
-        self.btn_discover = QPushButton("Discover Devices")
+        self.btn_discover = QPushButton("Discover Sonicator")
         self.btn_connect = QPushButton("Connect")
-        self.btn_home = QPushButton("Home GRBL")
-        self.btn_start = QPushButton("Start Run")
+        self.btn_load_audio = QPushButton("Load Audio")
+        self.btn_start = QPushButton("Start")
         self.btn_pause = QPushButton("Pause")
         self.btn_stop = QPushButton("Stop")
         self.btn_pause.setCheckable(True)
 
         top.addWidget(self.btn_discover)
         top.addWidget(self.btn_connect)
-        top.addWidget(self.btn_home)
+        top.addWidget(self.btn_load_audio)
         top.addWidget(self.btn_start)
         top.addWidget(self.btn_pause)
         top.addWidget(self.btn_stop)
@@ -60,70 +54,40 @@ class MainWindow(QMainWindow):
         self.lbl_status = QLabel("Status: disconnected")
         layout.addWidget(self.lbl_status)
 
-        # Plan table
-        plan_box = QGroupBox("12-slot Plan")
-        plan_layout = QVBoxLayout(plan_box)
+        self.lbl_audio = QLabel("Audio: (none)")
+        self.lbl_audio.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.lbl_audio)
 
-        self.table = QTableWidget(self.calib.slots, 4)
-        self.table.setHorizontalHeaderLabels(["Slot", "Type", "Power (W)", "Time (s)"])
-        self.table.verticalHeader().setVisible(False)
-        self._init_table()
-        plan_layout.addWidget(self.table)
+        self.lbl_soundfont = QLabel("Soundfont: (none)")
+        self.lbl_soundfont.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.lbl_soundfont)
 
-        # Rinse controls
-        rinse_row = QHBoxLayout()
-        rinse_row.addWidget(QLabel("Rinse slot index:"))
-        self.spin_rinse_slot = QSpinBox()
-        self.spin_rinse_slot.setRange(0, self.calib.slots - 1)
-        self.spin_rinse_slot.setValue(0)
-        rinse_row.addWidget(self.spin_rinse_slot)
+        # Audio settings
+        audio_box = QGroupBox("Audio Sonication Settings")
+        form = QFormLayout(audio_box)
 
-        rinse_row.addWidget(QLabel("Rinse power (W):"))
-        self.spin_rinse_power = QDoubleSpinBox()
-        self.spin_rinse_power.setRange(0, 200)
-        self.spin_rinse_power.setDecimals(2)
-        self.spin_rinse_power.setValue(self.calib.rinse_power_w)
-        rinse_row.addWidget(self.spin_rinse_power)
+        self.spin_min_power = QDoubleSpinBox()
+        self.spin_min_power.setRange(0, 200)
+        self.spin_min_power.setDecimals(2)
+        self.spin_min_power.setValue(5.0)
 
-        rinse_row.addWidget(QLabel("Rinse time (s):"))
-        self.spin_rinse_time = QSpinBox()
-        self.spin_rinse_time.setRange(0, 36000)
-        self.spin_rinse_time.setValue(self.calib.rinse_time_s)
-        rinse_row.addWidget(self.spin_rinse_time)
+        self.spin_max_power = QDoubleSpinBox()
+        self.spin_max_power.setRange(0, 200)
+        self.spin_max_power.setDecimals(2)
+        self.spin_max_power.setValue(60.0)
 
-        plan_layout.addLayout(rinse_row)
-        layout.addWidget(plan_box)
+        self.spin_frame_ms = QSpinBox()
+        self.spin_frame_ms.setRange(5, 500)
+        self.spin_frame_ms.setValue(50)
 
-        # Calibration box
-        calib_box = QGroupBox("Calibration / Motion Settings")
-        form = QFormLayout(calib_box)
+        form.addRow("Min power (W)", self.spin_min_power)
+        form.addRow("Max power (W)", self.spin_max_power)
+        form.addRow("Frame size (ms)", self.spin_frame_ms)
 
-        self.spin_x_mm_per_slot = QDoubleSpinBox(); self.spin_x_mm_per_slot.setRange(0.001, 500); self.spin_x_mm_per_slot.setDecimals(4); self.spin_x_mm_per_slot.setValue(self.calib.x_mm_per_slot)
-        self.spin_x_zero = QDoubleSpinBox(); self.spin_x_zero.setRange(-10000, 10000); self.spin_x_zero.setDecimals(3); self.spin_x_zero.setValue(self.calib.x_zero_offset_mm)
-        self.combo_x_dir = QComboBox(); self.combo_x_dir.addItems(["+1", "-1"]); self.combo_x_dir.setCurrentIndex(0 if self.calib.x_dir == 1 else 1)
+        self.btn_load_soundfont = QPushButton("Load Soundfont (MIDI)")
+        form.addRow(self.btn_load_soundfont)
 
-        self.spin_y_up = QDoubleSpinBox(); self.spin_y_up.setRange(-10000, 10000); self.spin_y_up.setDecimals(3); self.spin_y_up.setValue(self.calib.y_up_mm)
-        self.spin_y_down = QDoubleSpinBox(); self.spin_y_down.setRange(-10000, 10000); self.spin_y_down.setDecimals(3); self.spin_y_down.setValue(self.calib.y_down_mm)
-        self.combo_y_dir = QComboBox(); self.combo_y_dir.addItems(["+1", "-1"]); self.combo_y_dir.setCurrentIndex(0 if self.calib.y_dir == 1 else 1)
-        self.spin_y_home_clear = QDoubleSpinBox(); self.spin_y_home_clear.setRange(0, 10000); self.spin_y_home_clear.setDecimals(3); self.spin_y_home_clear.setValue(self.calib.y_home_clearance_mm)
-
-        self.spin_feed_xy = QDoubleSpinBox(); self.spin_feed_xy.setRange(10, 20000); self.spin_feed_xy.setDecimals(1); self.spin_feed_xy.setValue(self.calib.feed_xy)
-        self.spin_feed_y = QDoubleSpinBox(); self.spin_feed_y.setRange(10, 20000); self.spin_feed_y.setDecimals(1); self.spin_feed_y.setValue(self.calib.feed_y)
-
-        self.spin_settle = QDoubleSpinBox(); self.spin_settle.setRange(0, 10); self.spin_settle.setDecimals(2); self.spin_settle.setValue(self.calib.settle_after_move_s)
-
-        form.addRow("X mm per slot", self.spin_x_mm_per_slot)
-        form.addRow("X zero offset (mm)", self.spin_x_zero)
-        form.addRow("X direction", self.combo_x_dir)
-        form.addRow("Y up position (mm)", self.spin_y_up)
-        form.addRow("Y down delta (mm)", self.spin_y_down)
-        form.addRow("Y direction", self.combo_y_dir)
-        form.addRow("Home retreat (mm)", self.spin_y_home_clear)
-        form.addRow("Feed XY (mm/min)", self.spin_feed_xy)
-        form.addRow("Feed Y (mm/min)", self.spin_feed_y)
-        form.addRow("Settle after moves (s)", self.spin_settle)
-
-        layout.addWidget(calib_box)
+        layout.addWidget(audio_box)
 
         # Log
         self.log = QTextEdit()
@@ -133,37 +97,15 @@ class MainWindow(QMainWindow):
         # Wire actions
         self.btn_discover.clicked.connect(self.on_discover)
         self.btn_connect.clicked.connect(self.on_connect)
-        self.btn_home.clicked.connect(self.on_home)
+        self.btn_load_audio.clicked.connect(self.on_load_audio)
         self.btn_start.clicked.connect(self.on_start)
         self.btn_pause.clicked.connect(self.on_pause)
         self.btn_stop.clicked.connect(self.on_stop)
+        self.btn_load_soundfont.clicked.connect(self.on_load_soundfont)
 
         self._set_buttons_connected(False)
 
-    def _init_table(self):
-        for r in range(self.calib.slots):
-            item0 = QTableWidgetItem(str(r))
-            item0.setFlags(item0.flags() & ~Qt.ItemIsEditable)
-            self.table.setItem(r, 0, item0)
-
-            combo = QComboBox()
-            combo.addItems(["EMPTY", "SAMPLE", "RINSE"])
-            combo.setCurrentText("EMPTY")
-            self.table.setCellWidget(r, 1, combo)
-
-            p = QDoubleSpinBox()
-            p.setRange(0, 200)
-            p.setDecimals(2)
-            p.setValue(20.0)
-            self.table.setCellWidget(r, 2, p)
-
-            t = QSpinBox()
-            t.setRange(0, 36000)
-            t.setValue(60)
-            self.table.setCellWidget(r, 3, t)
-
     def _set_buttons_connected(self, connected: bool):
-        self.btn_home.setEnabled(connected)
         self.btn_start.setEnabled(connected)
         self.btn_pause.setEnabled(connected)
         self.btn_stop.setEnabled(connected)
@@ -172,73 +114,66 @@ class MainWindow(QMainWindow):
         self.log.append(s)
         self.log.ensureCursorVisible()
 
-    def _read_calib_from_ui(self):
-        self.calib.x_mm_per_slot = float(self.spin_x_mm_per_slot.value())
-        self.calib.x_zero_offset_mm = float(self.spin_x_zero.value())
-        self.calib.x_dir = +1 if self.combo_x_dir.currentText() == "+1" else -1
-
-        self.calib.y_up_mm = float(self.spin_y_up.value())
-        self.calib.y_down_mm = float(self.spin_y_down.value())
-        self.calib.y_dir = +1 if self.combo_y_dir.currentText() == "+1" else -1
-        self.calib.y_home_clearance_mm = float(self.spin_y_home_clear.value())
-
-        self.calib.feed_xy = float(self.spin_feed_xy.value())
-        self.calib.feed_y = float(self.spin_feed_y.value())
-        self.calib.settle_after_move_s = float(self.spin_settle.value())
-
-        self.calib.rinse_power_w = float(self.spin_rinse_power.value())
-        self.calib.rinse_time_s = int(self.spin_rinse_time.value())
-
-    def _read_plan_from_table(self) -> List[SlotPlan]:
-        plans: List[SlotPlan] = []
-        for r in range(self.calib.slots):
-            kind = self.table.cellWidget(r, 1).currentText()
-            p = float(self.table.cellWidget(r, 2).value())
-            t = int(self.table.cellWidget(r, 3).value())
-            plans.append(SlotPlan(kind=kind, power_w=p, time_s=t))
-        return plans
-
     # ---------------- Actions ----------------
 
     def on_discover(self):
         self._close_devices()
-        self.log_line("Discovering devices...")
-        def _log(s): self.log_line(s)
+        self.log_line("Discovering sonicator...")
+        self.dev_q125 = discover_devices(self.log_line)
 
-        grbl_dev, q125_dev = discover_devices(_log)
-        self.dev_grbl, self.dev_q125 = grbl_dev, q125_dev
-
-        if not grbl_dev or not q125_dev:
-            QMessageBox.warning(self, "Discovery", "Could not find both devices.\n"
-                                                 "Ensure both Arduinos are plugged in and printing startup banners.")
-            self.lbl_status.setText("Status: discovery incomplete")
+        if not self.dev_q125:
+            QMessageBox.warning(self, "Discovery", "Could not find the sonicator controller.\n"
+                                                 "Ensure the Arduino is plugged in and printing its startup banner.")
+            self.lbl_status.setText("Status: discovery failed")
             return
 
-        self.lbl_status.setText(f"Status: discovered GRBL={grbl_dev.port}, Q125={q125_dev.port}")
+        self.lbl_status.setText(f"Status: discovered Q125={self.dev_q125.port}")
 
     def on_connect(self):
-        if not self.dev_grbl or not self.dev_q125:
-            QMessageBox.warning(self, "Connect", "Run Discover Devices first.")
+        if not self.dev_q125:
+            QMessageBox.warning(self, "Connect", "Run Discover Sonicator first.")
             return
 
-        self.grbl = GrblController(self.dev_grbl, self.log_line)
         self.q125 = SonicatorController(self.dev_q125, self.log_line)
 
-        # Clear any startup chatter (requirement)
-        self.dev_grbl.flush_input()
+        # Clear any startup chatter
         self.dev_q125.flush_input()
 
         self._set_buttons_connected(True)
         self.lbl_status.setText("Status: connected")
         self.log_line("Connected. Buffers cleared.")
 
+    def on_load_audio(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select audio file",
+            "",
+            "Audio Files (*.wav *.mp3 *.mp4 *.m4a *.mid *.midi)"
+        )
+        if not path:
+            return
+        self.audio_path = path
+        self.lbl_audio.setText(f"Audio: {path}")
+
+    def on_load_soundfont(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select soundfont file",
+            "",
+            "Soundfont Files (*.sf2)"
+        )
+        if not path:
+            return
+        self.soundfont_path = path
+        self.lbl_soundfont.setText(f"Soundfont: {path}")
+
     def _close_devices(self):
-        for dev in (self.dev_grbl, self.dev_q125):
-            if dev:
-                dev.close()
-        self.dev_grbl = None
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        if self.dev_q125:
+            self.dev_q125.close()
         self.dev_q125 = None
-        self.grbl = None
         self.q125 = None
         self._set_buttons_connected(False)
 
@@ -246,53 +181,43 @@ class MainWindow(QMainWindow):
         self._close_devices()
         super().closeEvent(event)
 
-    def on_home(self):
-        if not self.grbl:
-            return
-        self._read_calib_from_ui()
-        self.log_line("Homing GRBL...")
-        self.grbl.wake()
-        self.grbl.unlock()
-        ok = self.grbl.home()
-        if ok:
-            self.grbl.set_work_origin()
-            self.log_line("Home OK. Work origin set.")
-            ok_move = self.grbl.move_abs(
-                y=self.calib.y_up_position(self.calib.y_home_clearance_mm),
-                feed=self.calib.feed_y
-            )
-            if not ok_move:
-                self.log_line("Warning: failed to retreat after homing.")
-        else:
-            self.log_line("Home FAILED.")
-
     def on_start(self):
-        if not (self.grbl and self.q125):
+        if not self.q125:
             return
-
-        self._read_calib_from_ui()
-        plans = self._read_plan_from_table()
-        rinse_idx = int(self.spin_rinse_slot.value())
-
-        rinse_marked = [i for i, sp in enumerate(plans) if sp.kind == "RINSE"]
-        if len(rinse_marked) != 1:
-            QMessageBox.warning(self, "Plan error", "Mark exactly ONE slot as RINSE in the table.")
+        if not self.audio_path:
+            QMessageBox.warning(self, "Audio", "Select an audio file first.")
             return
-        if rinse_marked[0] != rinse_idx:
-            QMessageBox.warning(self, "Plan error", "Rinse slot index must match the slot marked RINSE.")
-            return
-
         if self.worker and self.worker.isRunning():
-            QMessageBox.warning(self, "Run", "A run is already in progress.")
+            QMessageBox.warning(self, "Audio", "Audio playback is already running.")
             return
 
-        self.worker = RunWorker(self.grbl, self.q125, self.calib, plans, rinse_idx)
+        ext = os.path.splitext(self.audio_path)[1].lower()
+        if ext in {".mid", ".midi"} and not self.soundfont_path:
+            QMessageBox.warning(self, "Audio", "Select a soundfont (.sf2) for MIDI playback.")
+            return
+
+        min_power = float(self.spin_min_power.value())
+        max_power = float(self.spin_max_power.value())
+        if max_power < min_power:
+            QMessageBox.warning(self, "Settings", "Max power must be >= min power.")
+            return
+
+        frame_ms = int(self.spin_frame_ms.value())
+
+        self.worker = AudioRunWorker(
+            self.q125,
+            self.audio_path,
+            min_power,
+            max_power,
+            frame_ms,
+            soundfont_path=self.soundfont_path,
+        )
         self.worker.sig_log.connect(self.log_line)
         self.worker.sig_done.connect(self._on_run_done)
 
         self.btn_pause.setChecked(False)
         self.worker.start()
-        self.lbl_status.setText("Status: running")
+        self.lbl_status.setText("Status: sonication running")
 
     def on_pause(self):
         if not self.worker:
